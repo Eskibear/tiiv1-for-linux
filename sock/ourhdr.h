@@ -8,6 +8,7 @@
 #include	<stdlib.h>		/* for convenience */
 #include	<string.h>		/* for convenience */
 #include	<unistd.h>		/* for convenience */
+#include	<getopt.h>
 
 #ifdef	notdef	/* delete for systems that don't define this (SunOS 4.x) */
 typedef	int	ssize_t;

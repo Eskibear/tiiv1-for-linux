@@ -1,5 +1,6 @@
 #include	<signal.h>
 #include	"ourhdr.h"
+#include	<asm/signal.h>
 
 static volatile sig_atomic_t	sigflag;
 								/* set nonzero by signal handler */

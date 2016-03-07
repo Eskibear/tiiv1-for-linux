@@ -8,6 +8,7 @@
  */
 
 #include	"sock.h"
+typedef void* caddr_t;
 
 /* Copy everything from stdin to "sockfd",
  * and everything from "sockfd" to stdout. */
