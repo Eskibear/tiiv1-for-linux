@@ -1,2 +1,2 @@
 # tiiv1-for-linux
-Revised source code of  "TCP/IP Illustrated Volume 1: The Protocols"  for Linux.
+Original code written by the author in 1993.
