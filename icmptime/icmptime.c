@@ -23,6 +23,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
@@ -48,9 +49,164 @@ u_long		inet_addr();
 char		*inet_ntoa();
 void		sig_alrm(int);
 
-main(argc, argv)
-int	argc;
-char	**argv;
+/*
+ * in_cksum --
+ *	Checksum routine for Internet Protocol family headers (C Version)
+ */
+int in_cksum(u_short* addr, int len)
+{
+	register int nleft = len;
+	register u_short *w = addr;
+	register int sum = 0;
+	u_short answer = 0;
+
+	/*
+	 * Our algorithm is simple, using a 32 bit accumulator (sum), we add
+	 * sequential 16 bit words to it, and at the end, fold back all the
+	 * carry bits from the top 16 bits into the lower 16 bits.
+	 */
+	while (nleft > 1)  {
+		sum += *w++;
+		nleft -= 2;
+	}
+
+	/* mop up an odd byte, if necessary */
+	if (nleft == 1) {
+		*(u_char *)(&answer) = *(u_char *)w ;
+		sum += answer;
+	}
+
+	/* add back carry outs from top 16 bits to low 16 bits */
+	sum = (sum >> 16) + (sum & 0xffff);	/* add hi 16 to low 16 */
+	sum += (sum >> 16);			/* add carry */
+	answer = ~sum;				/* truncate to 16 bits */
+	return(answer);
+}
+
+/*
+ * Send the request.
+ */
+
+int sender()
+{
+	int		i, cc;
+	struct icmp	*icp;
+
+	icp = (struct icmp *)outpack;
+	icp->icmp_type = ICMP_TSTAMP;
+	icp->icmp_code = 0;
+	icp->icmp_cksum = 0;	/* compute checksum below */
+	icp->icmp_seq = 12345;	/* seq and id must be reflected */
+	icp->icmp_id = getpid();
+
+		/* fill in originate timestamp: have to convert tv_sec
+		   from seconds since the Epoch to milliseconds since
+		   midnight, then add in microseconds */
+
+	gettimeofday(&tvorig, (struct timezone *)NULL);
+	tsorig = (tvorig.tv_sec % (24*60*60)) * 1000 + tvorig.tv_usec / 1000;
+	icp->icmp_otime = htonl(tsorig);
+	icp->icmp_rtime = 0;		/* filled in by receiver */
+	icp->icmp_ttime = 0;		/* filled in by receiver */
+
+	cc = datalen + 8;	/* 8 bytes of header, 12 bytes of data */
+
+					/* compute ICMP checksum */
+	icp->icmp_cksum = in_cksum((u_short *)icp, cc);
+
+	i = sendto(s, (char *)outpack, cc, 0, &whereto,
+	    				sizeof(struct sockaddr));
+	if (i < 0 || i != cc)  {
+		if (i < 0)
+			perror("sendto error");
+		printf("wrote %s %d chars, ret=%d\n", hostname, cc, i);
+	}
+}
+
+/*
+ * Process a received ICMP message.  Since we receive *all* ICMP messages
+ * that the kernel receives, we may receive other than the timestamp
+ * reply we're waiting for.
+ */
+
+int
+procpack(char* buf, int cc, struct sockaddr_in* from)
+{
+	int		i, hlen;
+	struct icmp	*icp;
+	struct ip	*ip;
+	struct timeval	tvdelta;
+
+	/* We could call gettimeofday() again to measure the RTT and use
+	 * that in computing the offset, but some (most?) systems only
+	 * have 100 Hz resoultion for this function and the RTT on a
+	 * LAN is usually less than this (i.e., it wouldn't buy us
+	 * anything). */
+
+#ifdef	notdef
+	gettimeofday(&tvrecv, (struct timezone *)NULL);
+#endif
+
+		/* Check the IP header */
+	ip = (struct ip *)buf;
+	hlen = ip->ip_hl << 2;
+	if (cc < hlen + ICMP_MINLEN) {
+		fprintf(stderr, "packet too short (%d bytes) from %s\n", cc,
+			  inet_ntoa(*(struct in_addr *)&from->sin_addr.s_addr));
+		return 0;
+	}
+
+		/* Now the ICMP part */
+	cc -= hlen;
+	icp = (struct icmp *)(buf + hlen);
+
+		/* With a raw ICMP socket we get all ICMP packets that
+		   come into the kernel. */
+
+	if (icp->icmp_type == ICMP_TSTAMPREPLY) {
+		if (ntohl(icp->icmp_otime) != tsorig)
+			printf("originate timestamp not echoed: sent $lu, received %lu\n",
+						tsorig, ntohl(icp->icmp_otime));
+		if (cc != 20)
+			printf("cc = %d, expected cc = 20\n", cc);
+		if (icp->icmp_seq != 12345)
+			printf("received sequence # %d\n", icp->icmp_seq);
+		if (icp->icmp_id != getpid())
+			printf("received id %d\n", icp->icmp_id);
+
+		/* tsorig and tsrecv are both signed longs.  The icmp_[ort]time
+		 * members in the structure are unsigned, but the max value
+		 * for the #millisec since midnight is (24*60*60*1000 - 1)
+		 * or 85,399,999, which easily fits into a signed long.
+		 * We want them signed to compute a signed difference. */
+
+		tsrecv = ntohl(icp->icmp_rtime);
+		tsdiff = tsrecv - tsorig;	/* difference in millisec */
+
+		printf("orig = %ld, recv = %ld\n",
+				ntohl(icp->icmp_otime), ntohl(icp->icmp_rtime));
+		printf("adjustment = %ld ms\n", tsdiff);
+		tvdelta.tv_sec  = tsdiff / 1000;	/* normally 0 */
+		tvdelta.tv_usec = (tsdiff % 1000) * 1000;
+		printf("correction = %ld sec, %ld usec\n",
+				tvdelta.tv_sec, tvdelta.tv_usec);
+		if (adjtime(&tvdelta, (struct timeval *) 0) < 0) {
+			perror("adjtime error");
+			exit(1);
+		}
+		return(0);	/* done */
+	} else
+		return(-1);	/* some other type of ICMP message */
+}
+
+
+void sig_alrm(int signo)
+{
+	printf("timeout\n");
+	exit(1);
+}
+
+int main(int argc, char** argv)
 {
 	int			i, ch, fdmask, hold, packlen, preload;
 	extern int		errno;
@@ -58,7 +214,9 @@ char	**argv;
 	struct sockaddr_in	*to;
 	struct protoent		*proto;
 	u_char			*packet;
-	char			*target, hnamebuf[MAXHOSTNAMELEN], *malloc();
+	char			*target, hnamebuf[MAXHOSTNAMELEN];
+  /*, *malloc();
+   */
 
 	if (argc != 2)
 		exit(1);
@@ -129,166 +287,4 @@ char	**argv;
 		if (procpack((char *)packet, cc, &from) == 0)
 			exit(0);	/* terminate if reply received */
 	}
-}
-
-/*
- * Send the request.
- */
-
-sender()
-{
-	int		i, cc;
-	struct icmp	*icp;
-
-	icp = (struct icmp *)outpack;
-	icp->icmp_type = ICMP_TSTAMP;
-	icp->icmp_code = 0;
-	icp->icmp_cksum = 0;	/* compute checksum below */
-	icp->icmp_seq = 12345;	/* seq and id must be reflected */
-	icp->icmp_id = getpid();
-
-		/* fill in originate timestamp: have to convert tv_sec
-		   from seconds since the Epoch to milliseconds since
-		   midnight, then add in microseconds */
-
-	gettimeofday(&tvorig, (struct timezone *)NULL);
-	tsorig = (tvorig.tv_sec % (24*60*60)) * 1000 + tvorig.tv_usec / 1000;
-	icp->icmp_otime = htonl(tsorig);
-	icp->icmp_rtime = 0;		/* filled in by receiver */
-	icp->icmp_ttime = 0;		/* filled in by receiver */
-
-	cc = datalen + 8;	/* 8 bytes of header, 12 bytes of data */
-
-					/* compute ICMP checksum */
-	icp->icmp_cksum = in_cksum((u_short *)icp, cc);
-
-	i = sendto(s, (char *)outpack, cc, 0, &whereto,
-	    				sizeof(struct sockaddr));
-	if (i < 0 || i != cc)  {
-		if (i < 0)
-			perror("sendto error");
-		printf("wrote %s %d chars, ret=%d\n", hostname, cc, i);
-	}
-}
-
-/*
- * Process a received ICMP message.  Since we receive *all* ICMP messages
- * that the kernel receives, we may receive other than the timestamp
- * reply we're waiting for.
- */
-
-int
-procpack(buf, cc, from)
-char			*buf;
-int			cc;
-struct sockaddr_in	*from;
-{
-	int		i, hlen;
-	struct icmp	*icp;
-	struct ip	*ip;
-	struct timeval	tvdelta;
-
-	/* We could call gettimeofday() again to measure the RTT and use
-	 * that in computing the offset, but some (most?) systems only
-	 * have 100 Hz resoultion for this function and the RTT on a
-	 * LAN is usually less than this (i.e., it wouldn't buy us
-	 * anything). */
-
-#ifdef	notdef
-	gettimeofday(&tvrecv, (struct timezone *)NULL);
-#endif
-
-		/* Check the IP header */
-	ip = (struct ip *)buf;
-	hlen = ip->ip_hl << 2;
-	if (cc < hlen + ICMP_MINLEN) {
-		fprintf(stderr, "packet too short (%d bytes) from %s\n", cc,
-			  inet_ntoa(*(struct in_addr *)&from->sin_addr.s_addr));
-		return;
-	}
-
-		/* Now the ICMP part */
-	cc -= hlen;
-	icp = (struct icmp *)(buf + hlen);
-
-		/* With a raw ICMP socket we get all ICMP packets that
-		   come into the kernel. */
-
-	if (icp->icmp_type == ICMP_TSTAMPREPLY) {
-		if (ntohl(icp->icmp_otime) != tsorig)
-			printf("originate timestamp not echoed: sent $lu, received %lu\n",
-						tsorig, ntohl(icp->icmp_otime));
-		if (cc != 20)
-			printf("cc = %d, expected cc = 20\n", cc);
-		if (icp->icmp_seq != 12345)
-			printf("received sequence # %d\n", icp->icmp_seq);
-		if (icp->icmp_id != getpid())
-			printf("received id %d\n", icp->icmp_id);
-
-		/* tsorig and tsrecv are both signed longs.  The icmp_[ort]time
-		 * members in the structure are unsigned, but the max value
-		 * for the #millisec since midnight is (24*60*60*1000 - 1)
-		 * or 85,399,999, which easily fits into a signed long.
-		 * We want them signed to compute a signed difference. */
-
-		tsrecv = ntohl(icp->icmp_rtime);
-		tsdiff = tsrecv - tsorig;	/* difference in millisec */
-
-		printf("orig = %ld, recv = %ld\n",
-				ntohl(icp->icmp_otime), ntohl(icp->icmp_rtime));
-		printf("adjustment = %ld ms\n", tsdiff);
-		tvdelta.tv_sec  = tsdiff / 1000;	/* normally 0 */
-		tvdelta.tv_usec = (tsdiff % 1000) * 1000;
-		printf("correction = %ld sec, %ld usec\n",
-				tvdelta.tv_sec, tvdelta.tv_usec);
-		if (adjtime(&tvdelta, (struct timeval *) 0) < 0) {
-			perror("adjtime error");
-			exit(1);
-		}
-		return(0);	/* done */
-	} else
-		return(-1);	/* some other type of ICMP message */
-}
-
-/*
- * in_cksum --
- *	Checksum routine for Internet Protocol family headers (C Version)
- */
-in_cksum(addr, len)
-	u_short *addr;
-	int len;
-{
-	register int nleft = len;
-	register u_short *w = addr;
-	register int sum = 0;
-	u_short answer = 0;
-
-	/*
-	 * Our algorithm is simple, using a 32 bit accumulator (sum), we add
-	 * sequential 16 bit words to it, and at the end, fold back all the
-	 * carry bits from the top 16 bits into the lower 16 bits.
-	 */
-	while (nleft > 1)  {
-		sum += *w++;
-		nleft -= 2;
-	}
-
-	/* mop up an odd byte, if necessary */
-	if (nleft == 1) {
-		*(u_char *)(&answer) = *(u_char *)w ;
-		sum += answer;
-	}
-
-	/* add back carry outs from top 16 bits to low 16 bits */
-	sum = (sum >> 16) + (sum & 0xffff);	/* add hi 16 to low 16 */
-	sum += (sum >> 16);			/* add carry */
-	answer = ~sum;				/* truncate to 16 bits */
-	return(answer);
-}
-
-void
-sig_alrm(int signo)
-{
-	printf("timeout\n");
-	exit(1);
 }
